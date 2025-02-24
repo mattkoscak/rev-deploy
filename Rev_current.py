@@ -201,7 +201,7 @@ Use examples, references (like [doc_0]) if needed. Maintain a clear and concise 
 
 # -------------------- Streamlit UI Code --------------------
 st.set_page_config(
-    page_title="Multi file insights with Rev",
+    page_title="Multi file insights",
     page_icon="🔍",
     layout="wide"
 )
@@ -245,16 +245,15 @@ if 'agent' not in st.session_state:
 
 # Sidebar
 with st.sidebar:
-    st.title("Cohere powered RAG")
+    st.title("Beta Test - Compass powered multi-file insights")
     st.write("""
-    Provide a question about your transcripts,
-    and I'll retrieve and summarize relevant insights.
+    Transcript Q&A at scale
     """)
     max_steps = 5
 
 # Main interface
 st.title("Multi file insights with Rev")
-query = st.text_area("Enter your transcript-based question:", height=100)
+query = st.text_area("Enter your question about the transcripts below...:", height=100)
 
 if st.button("Submit"):
     if not query.strip():
