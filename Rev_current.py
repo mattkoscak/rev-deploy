@@ -1,275 +1,289 @@
+import streamlit as st
+import hmac
 import os
 import json
-import time
 from typing import List, Dict, Optional
 import cohere
 from cohere.client import Client as CohereClient
 from cohere.compass.clients.compass import CompassClient
-import streamlit as st
 
+# -----------------------------------------
+# Global Password Protection (if desired)
+# -----------------------------------------
+def check_password():
+    """
+    Returns True if the user enters the correct global password.
+    The expected password is stored in st.secrets["password"].
+    """
+    def password_entered():
+        if hmac.compare_digest(st.session_state["password"], st.secrets["password"]):
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.text_input("Password", type="password", on_change=password_entered, key="password")
+    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+        st.error("Incorrect password.")
+    return st.session_state.get("password_correct", False)
+
+if not check_password():
+    st.stop()
+
+# -----------------------------------------
+# Configurable Parameters
+# -----------------------------------------
+MAX_RESEARCH_STEPS = 5      # Maximum times we let the model do "search" before forcing an answer
+RETRIEVAL_TOP_K = 5         # Number of chunks from Compass on each search
+TEMPERATURE = 0.0           # Keep it low for factual tasks
+COMMAND_MODEL = "command-nightly"  # Example Cohere model name
+
+# -----------------------------------------
+# TranscriptRAGAgent Class
+# -----------------------------------------
 class TranscriptRAGAgent:
+    """
+    A 'Deep Research'-style agent using Cohere + Compass.
+    It iteratively decides whether it has enough info to answer,
+    but we REQUIRE at least one retrieval step before finalizing.
+    """
+
     def __init__(self, compass_url: str, compass_token: str, cohere_api_key: str):
-        # Initialize API clients
-        self.co = CohereClient(
-            api_key=cohere_api_key,
-            client_name="transcript-rag-agent"
-        )
-        self.compass_client = CompassClient(
-            index_url=compass_url,
-            bearer_token=compass_token
-        )
-        
-        # Tracking research state
-        self.research_steps = []
-        self.collected_evidence = []
-        
-    def get_relevant_chunks(self, query: str, limit: int = 10) -> List[Dict]:
-        """Search the 'transcripts' index using Compass."""
+        # Initialize Cohere client
         try:
-            search_results = self.compass_client.search_chunks(
-                index_name="compass-rev",  # updated index
-                query=query,
-                top_k=limit
-            )
-            
-            documents = []
-            if search_results.hits:
-                for idx, hit in enumerate(search_results.hits):
-                    text = hit.content.get("text", "")
-                    documents.append({
-                        "title": f"doc_{idx}",
-                        "snippet": text
-                    })
-            return documents
+            self.co = CohereClient(api_key=cohere_api_key)
         except Exception as e:
-            st.error(f"Error retrieving documents: {e}")
+            st.error(f"Error initializing Cohere client: {e}")
+            st.stop()
+
+        # Initialize Compass client
+        try:
+            self.compass_client = CompassClient(index_url=compass_url, bearer_token=compass_token)
+        except Exception as e:
+            st.error(f"Error initializing Compass client: {e}")
+            st.stop()
+
+    def retrieve_docs(self, query: str, top_k: int = 5) -> List[str]:
+        """
+        Retrieve top_k chunks from Compass for a given query.
+        Return them as a list of snippet strings (with doc_x labels).
+        """
+        try:
+            results = self.compass_client.search_chunks(index_name="compass-rev", query=query, top_k=top_k)
+            snippets = []
+            if results.hits:
+                for idx, h in enumerate(results.hits):
+                    text = h.content.get("text", "")
+                    score = getattr(h, "score", 1.0)
+                    snippet_label = f"[doc_{idx}, score={score:.2f}]: {text}"
+                    snippets.append(snippet_label)
+            return snippets
+        except Exception as e:
+            st.warning(f"Compass retrieval error: {e}")
             return []
 
-    def plan_research(self, query: str) -> List[str]:
-        """Plan a multi-step approach to gather thorough insights from transcripts."""
-        prompt = f"""You are an expert analyzing transcripts. The user wants to explore this question:
-"{query}"
-
-Generate 3-5 short 'search queries' or 'research steps' that will gather all needed information.
-Example:
-1. "Azure revenue over time"
-2. "Factors impacting cloud growth"
-"""
-        response = self.co.chat(
-            message=prompt,
-            model="command-r-plus-08-2024",
-            temperature=0.2
-        )
-        
-        steps = [
-            line.strip() 
-            for line in response.text.split("\n") 
-            if line.strip() and line[0].isdigit()
-        ]
-        # Fallback if no steps extracted
-        if not steps:
-            steps = [query]
-        return steps
-
-    def analyze_evidence(self, evidence: List[Dict], query: str) -> Dict:
-        """Check whether we have enough info to thoroughly answer the user's question."""
-        evidence_text = "\n\n".join(e["snippet"] for e in evidence)
-        
-        prompt = f"""We have the following transcript snippets related to: "{query}"
-
-{evidence_text}
-
-Do we have enough information to answer the question in detail? 
-If not, what else do we need?
-
-Respond in JSON:
-{{
-    "is_complete": true/false,
-    "gaps": ["gap1", "gap2"],
-    "next_query": "some next search query"
-}}
-"""
-        response = self.co.chat(
-            message=prompt,
-            model="command-r-plus-08-2024",
-            temperature=0.1
-        )
-        
-        try:
-            return json.loads(response.text)
-        except:
-            return {
-                "is_complete": True,
-                "gaps": [],
-                "next_query": None
-            }
-
-    def synthesize_answer(self, evidence: List[Dict], query: str) -> str:
-        """Generate final comprehensive answer from transcript snippets."""
-        evidence_text = "\n\n".join(e["snippet"] for e in evidence)
-
-        prompt = f"""
-You are a top-tier analyst focusing on transcripts. The user asked: "{query}"
-Here are relevant transcript excerpts:
-{evidence_text}
-
-Craft a thorough, cohesive summary or answer addressing the user's question. 
-Use examples, references (like [doc_0]) if needed. Maintain a clear and concise style.
-"""
-        response = self.co.chat(
-            message=prompt,
-            model="command-r-plus-08-2024",
-            temperature=0.0
-        )
-        
-        return response.text
-
-    def research(self, query: str, max_steps: int = 5) -> Dict:
+    def run_deep_research(self, user_query: str, style: str = "default") -> Dict:
         """
-        Execute the multi-step approach to find and synthesize an answer for a 
-        transcript-based question.
+        Core loop: keep asking the model if it wants to search or answer.
+        We require at least one 'search' before it can produce a final 'answer'.
         """
-        self.research_steps = []
-        self.collected_evidence = []
-        
-        planned_queries = self.plan_research(query)
-        
-        step_count = 0
-        for search_query in planned_queries:
-            if step_count >= max_steps:
+
+        conversation = []
+        debug_steps = []
+
+        # 1) System instructions
+        system_msg = (
+            "You are a helpful 'Deep Research' AI. You have two possible actions:\n"
+            "1) \"search\": If you need more info, return JSON: {\"action\": \"search\", \"query\": \"...\"}\n"
+            "2) \"answer\": If you have enough info, return JSON: {\"action\": \"answer\", \"content\": \"...\"}\n"
+            "But you MUST perform at least one 'search' action before giving the final answer.\n\n"
+            "Additional rules:\n"
+            "- You may do multiple searches if the first results were insufficient.\n"
+            "- Provide references in your final answer if they come from retrieved snippets (e.g. [doc_0]).\n"
+            "- Do not fabricate references.\n"
+            "- If no data is found or it doesn't exist, you may finalize with an appropriate statement.\n"
+            "- Keep chain-of-thought hidden; only output valid JSON.\n"
+            f"- Style: {style}\n"
+        )
+        conversation.append({"role": "system", "content": system_msg})
+        conversation.append({"role": "user", "content": user_query})
+
+        steps_taken = 0
+        searches_done = 0
+        final_answer = "No answer produced."
+
+        while steps_taken < MAX_RESEARCH_STEPS:
+            # Build the prompt from conversation so far
+            prompt_text = self.build_faux_chat_prompt(conversation)
+
+            # Call Cohere to get next action
+            response = self.co.generate(
+                model=COMMAND_MODEL,
+                prompt=prompt_text,
+                max_tokens=300,
+                temperature=TEMPERATURE,
+                stop_sequences=["\n{\"action\""],
+            )
+            assistant_text = response.generations[0].text.strip()
+            debug_steps.append(f"LLM Output:\n{assistant_text}")
+
+            # Parse JSON
+            parsed = self.safe_json_parse(assistant_text)
+            if not parsed:
+                # If we can't parse, break
+                final_answer = "Could not parse the model's response as valid JSON."
                 break
-                
-            self.research_steps.append({
-                "step": step_count + 1,
-                "action": "search",
-                "query": search_query
+
+            action = parsed.get("action", "")
+            if action == "search":
+                # The model wants to search
+                search_query = parsed.get("query", "").strip()
+                if not search_query:
+                    final_answer = "Model requested a search but gave no query. Ending."
+                    break
+
+                # Actually do the retrieval
+                results = self.retrieve_docs(search_query, top_k=RETRIEVAL_TOP_K)
+
+                if len(results) == 0:
+                    # No results found
+                    conversation.append({
+                        "role": "system",
+                        "content": f"No documents found for search query: '{search_query}'."
+                    })
+                else:
+                    # Add results as a system message
+                    snippet_block = "\n\n".join(results)
+                    if len(snippet_block) > 6000:
+                        snippet_block = snippet_block[:6000] + "... (truncated)"
+                    conversation.append({
+                        "role": "system",
+                        "content": f"Search results for '{search_query}':\n{snippet_block}"
+                    })
+
+                searches_done += 1
+
+            elif action == "answer":
+                # The model is trying to produce a final answer
+                if searches_done == 0:
+                    # Force at least one search
+                    conversation.append({
+                        "role": "system",
+                        "content": (
+                            "You have not performed any search yet. You MUST do at least one search before finalizing."
+                        )
+                    })
+                    # We do NOT break; we let the loop continue so the model can try again
+                else:
+                    # Accept the final answer
+                    final_answer = parsed.get("content", "")
+                    break
+            else:
+                final_answer = f"Unrecognized action: {action}. Exiting."
+                break
+
+            steps_taken += 1
+
+        # If we exit due to steps limit
+        if steps_taken == MAX_RESEARCH_STEPS and searches_done > 0 and action != "answer":
+            # Force the model to finalize now
+            conversation.append({
+                "role": "system",
+                "content": "You have reached max steps. Produce a final answer now, using {\"action\":\"answer\",\"content\":\"...\"}."
             })
-            
-            # Search
-            new_evidence = self.get_relevant_chunks(search_query)
-            self.collected_evidence.extend(new_evidence)
-            
-            # Analyze
-            analysis = self.analyze_evidence(self.collected_evidence, query)
-            step_count += 1
-            
-            if analysis["is_complete"]:
-                break
-            if step_count >= max_steps:
-                break
-                
-            if analysis["next_query"]:
-                planned_queries.append(analysis["next_query"])
-        
-        final_answer = self.synthesize_answer(self.collected_evidence, query)
-        
+            prompt_text = self.build_faux_chat_prompt(conversation)
+            response = self.co.generate(
+                model=COMMAND_MODEL,
+                prompt=prompt_text,
+                max_tokens=400,
+                temperature=TEMPERATURE,
+                stop_sequences=["\n{\"action\""],
+            )
+            assistant_text = response.generations[0].text.strip()
+            debug_steps.append(f"LLM Output (forced final):\n{assistant_text}")
+
+            parsed = self.safe_json_parse(assistant_text)
+            if parsed and parsed.get("action") == "answer":
+                final_answer = parsed.get("content", "No content.")
+            else:
+                final_answer = "No valid final answer returned."
+
         return {
-            "query": query,
-            "steps": self.research_steps,
-            "evidence": self.collected_evidence,
-            "answer": final_answer
+            "query": user_query,
+            "answer": final_answer,
+            "debug_steps": debug_steps
         }
 
-# -------------------- Streamlit UI Code --------------------
+    def build_faux_chat_prompt(self, conversation: List[Dict]) -> str:
+        """
+        Build a 'chat-like' prompt for Cohere from the conversation list.
+        """
+        lines = []
+        for turn in conversation:
+            role = turn["role"]
+            content = turn["content"]
+            if role == "system":
+                lines.append(f"System: {content}\n")
+            elif role == "user":
+                lines.append(f"User: {content}\n")
+            else:
+                lines.append(f"Assistant: {content}\n")
+        # Prompt ends with "Assistant: "
+        lines.append("Assistant: ")
+        return "".join(lines)
+
+    def safe_json_parse(self, text: str) -> Optional[Dict]:
+        """
+        Try to parse the model's response as JSON. If fail, return None.
+        """
+        try:
+            return json.loads(text)
+        except:
+            return None
+
+# -----------------------------------------
+# Streamlit UI
+# -----------------------------------------
 st.set_page_config(
-    page_title="Multi file insights with Rev",
-    page_icon="🔍",
+    page_title="Deep Research-Style RAG Chatbot (Forced Search)",
     layout="wide"
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-.research-step {
-    padding: 1rem;
-    margin: 0.5rem 0;
-    border-radius: 4px;
-    background-color: #f8f9fa;
-}
-.evidence-box {
-    padding: 1rem;
-    margin: 0.5rem 0;
-    border-radius: 4px;
-    background-color: #e9ecef;
-}
-.answer-section {
-    padding: 2rem;
-    margin: 1rem 0;
-    border-radius: 8px;
-    background-color: white;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-}
-</style>
-""", unsafe_allow_html=True)
+st.title("Deep Research-Style RAG Chatbot (with Forced Minimum 1 Search)")
 
 if 'agent' not in st.session_state:
-    required_vars = [
-        "COHERE_API_KEY",
-        "COMPASS_TOKEN",
-        "COMPASS_URL"
-    ]
-    
-    missing_vars = [var for var in required_vars if not os.environ.get(var)]
+    required_vars = ["COHERE_API_KEY", "COMPASS_TOKEN", "COMPASS_URL"]
+    missing_vars = [v for v in required_vars if not os.environ.get(v)]
     if missing_vars:
         st.error(f"Missing environment variables: {', '.join(missing_vars)}")
         st.stop()
-    
     st.session_state.agent = TranscriptRAGAgent(
         compass_url=os.environ["COMPASS_URL"],
         compass_token=os.environ["COMPASS_TOKEN"],
         cohere_api_key=os.environ["COHERE_API_KEY"]
     )
 
-# Sidebar
-with st.sidebar:
-    st.title("Cohere powered RAG")
-    st.write("""
-    Provide a question about your transcripts,
-    and I'll retrieve and summarize relevant insights.
-    """)
-    max_steps = 5
-    # New toggle for generating a concise answer
-    concise_toggle = st.checkbox("Generate a concise answer", value=False)
+query = st.text_area("Enter your question about the transcripts:", height=100)
+style_mode = st.selectbox(
+    "Answer Style",
+    options=["default", "concise", "verbose"],
+    index=0,
+    help="Choose the level of detail for the final answer."
+)
 
-# Main interface
-st.title("Multi file insights with Rev")
-
-query = st.text_area("Enter your transcript-based question:", height=100)
-
-if st.button("Submit"):
+if st.button("Submit Question"):
     if not query.strip():
         st.warning("Please enter a question.")
     else:
-        with st.spinner("Gathering insights..."):
-            result = st.session_state.agent.research(query, max_steps=max_steps)
-            
-            final_answer = result["answer"]
-            # If concise toggle is enabled, run additional transformation
-            if concise_toggle:
-                concise_prompt = f"""
-You are a top-tier analyst. The following is a detailed answer based on transcript excerpts:
-"{final_answer}"
+        with st.spinner("Researching..."):
+            result_dict = st.session_state.agent.run_deep_research(query, style_mode)
 
-Now, please rewrite the answer in a concise Q&A format similar to:
-Q: [Your question here]
-A: [Concise answer]
+        st.subheader("Answer")
+        st.write(result_dict["answer"])
 
-Ensure the answer is brief, to the point, and mentions the source if applicable.
-"""
-                response = st.session_state.agent.co.chat(
-                    message=concise_prompt,
-                    model="command-r-plus-08-2024",
-                    temperature=0.0
-                )
-                final_answer = response.text
-            
-            # Display final answer
-            st.subheader("Answer")
-            st.markdown(final_answer)
-            
-            # Optionally show sources
-            with st.expander("View Sources"):
-                for idx, evidence in enumerate(result["evidence"]):
-                    st.markdown(f"**Source {idx + 1}:**")
-                    st.markdown(evidence["snippet"])
-                    st.markdown("---")
+        with st.expander("Show Debug Steps"):
+            for i, step in enumerate(result_dict["debug_steps"]):
+                st.markdown(f"**Step {i+1}**\n```\n{step}\n```")
