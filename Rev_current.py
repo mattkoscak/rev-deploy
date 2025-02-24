@@ -1,5 +1,12 @@
 import hmac
 import streamlit as st
+import os
+import json
+import time
+from typing import List, Dict, Optional
+import cohere
+from cohere.client import Client as CohereClient
+from cohere.compass.clients.compass import CompassClient
 
 # --- Global Password Protection ---
 def check_password():
@@ -29,14 +36,6 @@ if not check_password():
 # --- End Global Password Protection ---
 
 
-import os
-import json
-import time
-from typing import List, Dict, Optional
-import cohere
-from cohere.client import Client as CohereClient
-from cohere.compass.clients.compass import CompassClient
-
 # -------------------- TranscriptRAGAgent Class --------------------
 class TranscriptRAGAgent:
     def __init__(self, compass_url: str, compass_token: str, cohere_api_key: str):
@@ -52,12 +51,12 @@ class TranscriptRAGAgent:
         # Tracking research state
         self.research_steps = []
         self.collected_evidence = []
-
+        
     def get_relevant_chunks(self, query: str, limit: int = 10) -> List[Dict]:
         """Search the 'transcripts' index using Compass."""
         try:
             search_results = self.compass_client.search_chunks(
-                index_name="compass-rev",  # updated index
+                index_name="transcripts",  # updated index
                 query=query,
                 top_k=limit
             )
@@ -76,18 +75,20 @@ class TranscriptRAGAgent:
 
     def plan_research(self, query: str) -> List[str]:
         """Plan a multi-step approach to gather thorough insights from transcripts."""
-        prompt = f"""You are an expert analyst of transcript data. The user asked:
+        prompt = f"""You are an expert analyzing transcripts. The user wants to explore this question:
 "{query}"
-Generate 3-5 short, focused research steps (or search queries) to cover all relevant aspects of this question.
-Examples:
-1. "Key discussion points on family health from the transcript"
-2. "Mentions of physical activity and shared meals in the discussion"
+
+Generate 3-5 short 'search queries' or 'research steps' that will gather all needed information.
+Example:
+1. "Azure revenue over time"
+2. "Factors impacting cloud growth"
 """
         response = self.co.chat(
             message=prompt,
             model="command-r-plus-08-2024",
             temperature=0.2
         )
+        
         steps = [
             line.strip() 
             for line in response.text.split("\n") 
@@ -101,18 +102,19 @@ Examples:
     def analyze_evidence(self, evidence: List[Dict], query: str) -> Dict:
         """Check whether we have enough info to thoroughly answer the user's question."""
         evidence_text = "\n\n".join(e["snippet"] for e in evidence)
-        prompt = f"""We have the following transcript excerpts related to the question:
-"{query}"
+        
+        prompt = f"""We have the following transcript snippets related to: "{query}"
 
 {evidence_text}
 
-Based on these excerpts, do we have enough detailed information to provide a comprehensive answer?
-If not, list what additional details or angles are needed.
-Respond in JSON in the following format:
+Do we have enough information to answer the question in detail? 
+If not, what else do we need?
+
+Respond in JSON:
 {{
     "is_complete": true/false,
     "gaps": ["gap1", "gap2"],
-    "next_query": "a focused follow-up query"
+    "next_query": "some next search query"
 }}
 """
         response = self.co.chat(
@@ -120,9 +122,10 @@ Respond in JSON in the following format:
             model="command-r-plus-08-2024",
             temperature=0.1
         )
+        
         try:
             return json.loads(response.text)
-        except Exception as e:
+        except:
             return {
                 "is_complete": True,
                 "gaps": [],
@@ -130,18 +133,15 @@ Respond in JSON in the following format:
             }
 
     def synthesize_answer(self, evidence: List[Dict], query: str) -> str:
-        """Generate final comprehensive answer from transcript excerpts."""
+        """Generate final comprehensive answer from transcript snippets."""
         evidence_text = "\n\n".join(e["snippet"] for e in evidence)
         prompt = f"""
-You are a top-tier analyst specializing in transcript data. The user asked:
-"{query}"
-Below are relevant transcript excerpts:
+You are a top-tier analyst focusing on transcripts. The user asked: "{query}"
+Here are relevant transcript excerpts:
 {evidence_text}
 
-Based on these excerpts, craft a detailed and cohesive answer that explains the key points. 
-The answer should begin by referencing the discussion (e.g., "The discussion highlights that ...") and focus on explaining how the described actions (such as joint physical activities and shared meals) promote overall well-being.
-Avoid extraneous details like financial or environmental factors unless they are essential. 
-Include references to sources when relevant (e.g., [doc_0]).
+Craft a thorough, cohesive summary or answer addressing the user's question. 
+Use examples, references (like [doc_0]) if needed. Maintain a clear and concise style.
 """
         response = self.co.chat(
             message=prompt,
@@ -152,37 +152,52 @@ Include references to sources when relevant (e.g., [doc_0]).
 
     def research(self, query: str, max_steps: int = 5) -> Dict:
         """
-        Execute a multi-step approach to synthesize an answer for a transcript-based question.
+        Execute the multi-step approach to find and synthesize an answer for a 
+        transcript-based question.
         """
         self.research_steps = []
         self.collected_evidence = []
+        
         planned_queries = self.plan_research(query)
+        
         step_count = 0
         for search_query in planned_queries:
             if step_count >= max_steps:
                 break
+                
             self.research_steps.append({
                 "step": step_count + 1,
                 "action": "search",
                 "query": search_query
             })
+            
+            # Search
             new_evidence = self.get_relevant_chunks(search_query)
             self.collected_evidence.extend(new_evidence)
+            
+            # Analyze
             analysis = self.analyze_evidence(self.collected_evidence, query)
             step_count += 1
+            
             if analysis["is_complete"]:
                 break
             if step_count >= max_steps:
                 break
+                
             if analysis["next_query"]:
                 planned_queries.append(analysis["next_query"])
+        
         final_answer = self.synthesize_answer(self.collected_evidence, query)
+        
         return {
             "query": query,
             "steps": self.research_steps,
             "evidence": self.collected_evidence,
             "answer": final_answer
         }
+
+# -------------------- End TranscriptRAGAgent Class --------------------
+
 
 # -------------------- Streamlit UI Code --------------------
 st.set_page_config(
@@ -221,12 +236,14 @@ if 'agent' not in st.session_state:
     if missing_vars:
         st.error(f"Missing environment variables: {', '.join(missing_vars)}")
         st.stop()
+    
     st.session_state.agent = TranscriptRAGAgent(
         compass_url=os.environ["COMPASS_URL"],
         compass_token=os.environ["COMPASS_TOKEN"],
         cohere_api_key=os.environ["COHERE_API_KEY"]
     )
 
+# Sidebar
 with st.sidebar:
     st.title("Cohere powered RAG")
     st.write("""
@@ -234,8 +251,8 @@ with st.sidebar:
     and I'll retrieve and summarize relevant insights.
     """)
     max_steps = 5
-    concise_toggle = st.checkbox("Generate a concise answer", value=False)
 
+# Main interface
 st.title("Multi file insights with Rev")
 query = st.text_area("Enter your transcript-based question:", height=100)
 
@@ -245,26 +262,12 @@ if st.button("Submit"):
     else:
         with st.spinner("Gathering insights..."):
             result = st.session_state.agent.research(query, max_steps=max_steps)
-            final_answer = result["answer"]
-            if concise_toggle:
-                concise_prompt = f"""
-Rewrite the following detailed answer into a concise, well-rounded summary.
-Ensure the summary starts by referencing the focus group discussion, for example: "The discussion highlights that ..."
-Focus on how the actions described in the answer promote overall well-being.
-Do not include extraneous details such as mentions of financial resources or environmental factors unless directly relevant.
-Do not include any Q: or A: labels; only produce the final answer text.
-
-Detailed answer:
-"{final_answer}"
-"""
-                response = st.session_state.agent.co.chat(
-                    message=concise_prompt,
-                    model="command-r-plus-08-2024",
-                    temperature=0.0
-                )
-                final_answer = response.text.strip()
+            
+            # Display final answer only
             st.subheader("Answer")
-            st.markdown(final_answer)
+            st.markdown(result["answer"])
+            
+            # Optionally show sources
             with st.expander("View Sources"):
                 for idx, evidence in enumerate(result["evidence"]):
                     st.markdown(f"**Source {idx + 1}:**")
