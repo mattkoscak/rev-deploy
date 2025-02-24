@@ -1,3 +1,41 @@
+import hmac
+import streamlit as st
+import os
+import json
+import time
+from typing import List, Dict, Optional
+import cohere
+from cohere.client import Client as CohereClient
+from cohere.compass.clients.compass import CompassClient
+
+# --- Global Password Protection ---
+def check_password():
+    """
+    Returns True if the user enters the correct global password.
+    The expected password is stored in st.secrets["password"].
+    """
+    def password_entered():
+        # Compare user-entered password with the stored secret
+        if hmac.compare_digest(st.session_state["password"], st.secrets["password"]):
+            st.session_state["password_correct"] = True
+            # Remove password from session state for security
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.text_input("Password", type="password", on_change=password_entered, key="password")
+    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+        st.error("😕 Password incorrect")
+    return st.session_state.get("password_correct", False)
+
+if not check_password():
+    st.stop()
+# --- End Global Password Protection ---
+
+
 class TranscriptRAGAgent:
     def __init__(self, compass_url: str, compass_token: str, cohere_api_key: str):
         # Initialize API clients
@@ -305,3 +343,81 @@ If it's already good, return it unchanged.
             "evidence": self.collected_evidence,
             "answer": final_answer
         }
+
+# -------------------- End TranscriptRAGAgent Class --------------------
+
+
+# -------------------- Streamlit UI Code --------------------
+st.set_page_config(
+    page_title="Multi file insights with Rev",
+    page_icon="🔍",
+    layout="wide"
+)
+
+st.markdown("""
+<style>
+.research-step {
+    padding: 1rem;
+    margin: 0.5rem 0;
+    border-radius: 4px;
+    background-color: #f8f9fa;
+}
+.evidence-box {
+    padding: 1rem;
+    margin: 0.5rem 0;
+    border-radius: 4px;
+    background-color: #e9ecef;
+}
+.answer-section {
+    padding: 2rem;
+    margin: 1rem 0;
+    border-radius: 8px;
+    background-color: white;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+</style>
+""", unsafe_allow_html=True)
+
+if 'agent' not in st.session_state:
+    required_vars = ["COHERE_API_KEY", "COMPASS_TOKEN", "COMPASS_URL"]
+    missing_vars = [var for var in required_vars if not os.environ.get(var)]
+    if missing_vars:
+        st.error(f"Missing environment variables: {', '.join(missing_vars)}")
+        st.stop()
+    
+    st.session_state.agent = TranscriptRAGAgent(
+        compass_url=os.environ["COMPASS_URL"],
+        compass_token=os.environ["COMPASS_TOKEN"],
+        cohere_api_key=os.environ["COHERE_API_KEY"]
+    )
+
+# Sidebar
+with st.sidebar:
+    st.title("Cohere powered RAG")
+    st.write("""
+    Provide a question about your transcripts,
+    and I'll retrieve and summarize relevant insights.
+    """)
+    max_steps = 5
+
+# Main interface
+st.title("Multi file insights with Rev")
+query = st.text_area("Enter your transcript-based question:", height=100)
+
+if st.button("Submit"):
+    if not query.strip():
+        st.warning("Please enter a question.")
+    else:
+        with st.spinner("Gathering insights..."):
+            result = st.session_state.agent.research(query, max_steps=max_steps)
+            
+            # Display final answer only
+            st.subheader("Answer")
+            st.markdown(result["answer"])
+            
+            # Optionally show sources
+            with st.expander("View Sources"):
+                for idx, evidence in enumerate(result["evidence"]):
+                    st.markdown(f"**Source {idx + 1}:**")
+                    st.markdown(evidence["snippet"])
+                    st.markdown("---")
