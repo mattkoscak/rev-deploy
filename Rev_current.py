@@ -8,6 +8,39 @@ from cohere.compass.clients.compass import CompassClient
 import streamlit as st
 
 
+import streamlit as st
+import streamlit_authenticator as stauth
+
+# Define your users
+names = ['rev1']
+usernames = ['rev1']
+
+# Define the password in plain text that will be hashed.
+# In a production app, you would store these hashes securely (or use Streamlit Secrets).
+passwords = ['your_password_here']  # Change this to your chosen password
+
+# Generate hashed passwords. (Make sure to use 'generate_hashes()' method.)
+hashed_passwords = stauth.Hasher(passwords).generate_hashes()
+
+# Initialize the authenticator.
+authenticator = stauth.Authenticate(
+    {'names': names, 'usernames': usernames, 'passwords': hashed_passwords},
+    'some_cookie_name',  # Change this to a cookie name of your choice
+    'some_signature_key',  # Change this to a secret signature key
+    cookie_expiry_days=30
+)
+
+# Create the login widget.
+name, authentication_status, username = authenticator.login('Login', 'main')
+
+# Check if the user is authenticated.
+if not authentication_status:
+    st.error("Username/password is incorrect")
+    st.stop()  # Prevents the app from continuing until the user logs in
+else:
+    st.success(f"Welcome, {name}!")
+
+
 class TranscriptRAGAgent:
     def __init__(self, compass_url: str, compass_token: str, cohere_api_key: str):
         # Initialize API clients
