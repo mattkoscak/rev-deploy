@@ -267,9 +267,3 @@ if st.button("Submit"):
             st.subheader("Answer")
             st.markdown(result["answer"])
             
-            # Optionally show sources
-            with st.expander("View Sources"):
-                for idx, evidence in enumerate(result["evidence"]):
-                    st.markdown(f"**Source {idx + 1}:**")
-                    st.markdown(evidence["snippet"])
-                    st.markdown("---")
