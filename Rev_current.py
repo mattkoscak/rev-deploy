@@ -59,14 +59,23 @@ class TranscriptRAGAgent:
 
     def __init__(self, compass_url: str, compass_token: str, cohere_api_key: str):
         # Initialize API clients
-        self.co = CohereClient(
-            api_key=cohere_api_key,
-            client_name="transcript-rag-agent"
-        )
-        self.compass_client = CompassClient(
-            index_url=compass_url,
-            bearer_token=compass_token
-        )
+        try:
+            self.co = CohereClient(
+                api_key=cohere_api_key,
+                client_name="transcript-rag-agent"
+            )
+        except Exception as e:
+            st.error(f"Error initializing Cohere client: {e}")
+            st.stop()
+
+        try:
+            self.compass_client = CompassClient(
+                index_url=compass_url,
+                bearer_token=compass_token
+            )
+        except Exception as e:
+            st.error(f"Error initializing Compass client: {e}")
+            st.stop()
 
         self.research_steps = []
         self.collected_evidence = []
@@ -86,17 +95,31 @@ class TranscriptRAGAgent:
             documents = []
             if search_results.hits:
                 for idx, hit in enumerate(search_results.hits):
+                    # Defensive checks
+                    if not hasattr(hit, "content") or hit.content is None:
+                        st.warning(f"Warning: 'hit.content' is missing for hit index {idx}")
+                        continue
+                    if not isinstance(hit.content, dict):
+                        st.warning(f"Warning: 'hit.content' is not a dict for hit index {idx}, got {type(hit.content)}")
+                        continue
+
                     text = hit.content.get("text", "")
+                    # If 'score' is missing, default to 1.0
                     score = getattr(hit, "score", 1.0)
+
+                    # Filter out low-score hits
                     if score >= self.confidence_threshold:
                         documents.append({
                             "title": f"doc_{idx}",
                             "snippet": text,
                             "score": score
                         })
+            else:
+                st.info("No hits returned from Compass for query: " + query)
             return documents
+
         except Exception as e:
-            st.error(f"Error retrieving documents: {e}")
+            st.error(f"Error retrieving documents from Compass: {e}")
             return []
 
     # Query Decomposition & Expansion
@@ -115,11 +138,16 @@ class TranscriptRAGAgent:
             f"User Query: {user_query}\n\n"
             "Provide 2-5 bullet points, each a short search query or sub-question."
         )
-        response = self.co.chat(
-            message=prompt,
-            model="command-r-plus-08-2024",
-            temperature=0.2
-        )
+        try:
+            response = self.co.chat(
+                message=prompt,
+                model="command-r-plus-08-2024",
+                temperature=0.2
+            )
+        except Exception as e:
+            st.error(f"Error calling Cohere for plan_research: {e}")
+            return [user_query]  # fallback
+
         lines = response.text.strip().split("\n")
         steps = []
         for line in lines:
@@ -160,16 +188,29 @@ class TranscriptRAGAgent:
             "  \"next_query\": \"some new search query or null\"\n"
             "}\n"
         )
-        response = self.co.chat(
-            message=prompt,
-            model="command-r-plus-08-2024",
-            temperature=0.2
-        )
+        try:
+            response = self.co.chat(
+                message=prompt,
+                model="command-r-plus-08-2024",
+                temperature=0.2
+            )
+        except Exception as e:
+            st.error(f"Error calling Cohere for analyze_evidence: {e}")
+            # Default to "we have enough" to avoid infinite loop
+            return {
+                "is_complete": True,
+                "gaps": [],
+                "next_query": None
+            }
+
+        raw_text = response.text.strip()
+        # Debug print
+        st.write("DEBUG - analyze_evidence raw LLM response:", raw_text)
 
         try:
-            parsed = json.loads(response.text)
+            parsed = json.loads(raw_text)
             if not isinstance(parsed, dict):
-                raise ValueError("Bad JSON")
+                raise ValueError("Cohere returned data but it's not a JSON object.")
             if "is_complete" not in parsed:
                 parsed["is_complete"] = True
             if "gaps" not in parsed:
@@ -177,7 +218,9 @@ class TranscriptRAGAgent:
             if "next_query" not in parsed:
                 parsed["next_query"] = None
             return parsed
-        except:
+        except Exception as e:
+            st.warning(f"Unable to parse JSON from analyze_evidence response: {e}")
+            st.write("DEBUG - Fallback to is_complete = True")
             return {
                 "is_complete": True,
                 "gaps": [],
@@ -216,12 +259,16 @@ If there's insufficient info, say: "I do not have enough information from the tr
 
 Final Answer:
 """
-        response = self.co.chat(
-            message=prompt,
-            model="command-r-plus-08-2024",
-            temperature=0.0
-        )
-        return response.text.strip()
+        try:
+            response = self.co.chat(
+                message=prompt,
+                model="command-r-plus-08-2024",
+                temperature=0.0
+            )
+            return response.text.strip()
+        except Exception as e:
+            st.error(f"Error calling Cohere for synthesize_answer: {e}")
+            return "I'm sorry, I encountered an error generating the answer."
 
     # Multi-step Orchestrator
     def research(self, user_query: str, max_rounds: int, top_k: int) -> Dict:
@@ -233,6 +280,7 @@ Final Answer:
         self.research_steps = []
         self.collected_evidence = []
 
+        # Plan
         planned_queries = self.plan_research(user_query)
         round_count = 0
 
@@ -242,7 +290,11 @@ Final Answer:
 
             self.research_steps.append({"step": round_count+1, "sub_query": sq})
             new_evidence = self.get_relevant_chunks(sq, top_k=top_k)
-            self.collected_evidence.extend(new_evidence)
+            if new_evidence:
+                self.collected_evidence.extend(new_evidence)
+            else:
+                st.info(f"No new evidence retrieved for sub-query: {sq}")
+
             analysis = self.analyze_evidence(user_query, self.collected_evidence)
             round_count += 1
 
@@ -250,6 +302,7 @@ Final Answer:
                 break
             else:
                 if analysis["next_query"]:
+                    st.write(f"DEBUG - Next query suggested: {analysis['next_query']}")
                     planned_queries.append(analysis["next_query"])
 
         final_answer = self.synthesize_answer(user_query, self.collected_evidence)
@@ -269,7 +322,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Transcript Q&A (Simple)")
+st.title("Transcript Q&A (Simple) - Debug Version")
 
 # If not in session, init agent
 if 'agent' not in st.session_state:
@@ -294,19 +347,23 @@ if st.button("Submit Question"):
         st.warning("Please enter a question.")
     else:
         with st.spinner("Searching transcripts..."):
-            # Hidden parameters:
-            result = st.session_state.agent.research(
-                user_query=query,
-                max_rounds=MAX_ROUNDS,
-                top_k=TOP_K
-            )
-            answer = result["answer"]
+            try:
+                result = st.session_state.agent.research(
+                    user_query=query,
+                    max_rounds=MAX_ROUNDS,
+                    top_k=TOP_K
+                )
+                answer = result["answer"]
+            except Exception as e:
+                st.error("An unexpected error occurred in `research`:")
+                st.exception(e)
+                st.stop()
 
         st.subheader("Answer")
         st.write(answer)
 
-        # If you'd like to optionally show user the sources (in an expander):
-        with st.expander("Show Retrieval Evidence"):
+        # Show debug details about retrieval steps:
+        with st.expander("Show Retrieval Evidence (Debug)"):
             st.markdown("#### Research Steps")
             for step_data in result["steps"]:
                 st.write(f"**Step {step_data['step']}**: {step_data['sub_query']}")
