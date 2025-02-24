@@ -107,8 +107,8 @@ Example:
 
 {evidence_text}
 
-Do we have enough information to answer the question in detail? 
-If not, what else do we need?
+Do we have enough information to answer the question in detail using only these excerpts? 
+If not, what additional details or angles are needed?
 
 Respond in JSON:
 {{
@@ -136,12 +136,19 @@ Respond in JSON:
         """Generate final comprehensive answer from transcript snippets."""
         evidence_text = "\n\n".join(e["snippet"] for e in evidence)
         prompt = f"""
-You are a top-tier analyst focusing on transcripts. The user asked: "{query}"
-Here are relevant transcript excerpts:
+You are a top-tier analyst specializing in transcript data. The user asked:
+"{query}"
+Below are relevant transcript excerpts:
 {evidence_text}
 
-Craft a thorough, cohesive summary or answer addressing the user's question. 
-Use examples, references (like [doc_0]) if needed. Maintain a clear and concise style.
+Craft a thorough, cohesive summary addressing the user's question solely based on the provided transcript excerpts.
+Ensure that the answer:
+- Begins by referencing the discussion (e.g., "The discussion highlights that ...").
+- Focuses on the key points from the transcript.
+- Does not include any external or inferred details not present in the excerpts.
+- Emphasizes how the described actions or examples promote overall well-being if that is relevant to the question.
+
+Include references to sources when appropriate (e.g., [doc_0]).
 """
         response = self.co.chat(
             message=prompt,
@@ -251,6 +258,8 @@ with st.sidebar:
     and I'll retrieve and summarize relevant insights.
     """)
     max_steps = 5
+    # Toggle for generating a concise answer version
+    concise_toggle = st.checkbox("Generate a concise answer", value=False)
 
 # Main interface
 st.title("Multi file insights with Rev")
@@ -262,10 +271,32 @@ if st.button("Submit"):
     else:
         with st.spinner("Gathering insights..."):
             result = st.session_state.agent.research(query, max_steps=max_steps)
+            final_answer = result["answer"]
+            
+            # If concise toggle is enabled, run additional transformation with strict instructions
+            if concise_toggle:
+                concise_prompt = f"""
+Rewrite the detailed answer below into a concise, well-rounded summary.
+Ensure that:
+- The summary begins by referencing the discussion (e.g., "The discussion highlights that ...").
+- Only details present in the provided transcript excerpts are used.
+- No external or inferred details are added.
+- Focus on how the examples promote overall well-being if relevant.
+Do not include any Q: or A: labels; only produce the final answer text.
+
+Detailed answer:
+"{final_answer}"
+"""
+                response = st.session_state.agent.co.chat(
+                    message=concise_prompt,
+                    model="command-r-plus-08-2024",
+                    temperature=0.0
+                )
+                final_answer = response.text.strip()
             
             # Display final answer only
             st.subheader("Answer")
-            st.markdown(result["answer"])
+            st.markdown(final_answer)
             
             # Optionally show sources
             with st.expander("View Sources"):
