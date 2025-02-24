@@ -14,7 +14,7 @@ import streamlit_authenticator as stauth
 names = ['rev1']
 usernames = ['rev1']
 # Replace 'YourPasswordHere' with your desired password.
-hashed_passwords = stauth.hasher(['rev1']).generate()
+hashed_passwords = stauth.Hasher(['rev1']).generate()
 
 authenticator = stauth.Authenticate(
     {'names': names, 'usernames': usernames, 'passwords': hashed_passwords},
