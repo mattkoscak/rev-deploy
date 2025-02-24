@@ -1,3 +1,34 @@
+import hmac
+import streamlit as st
+
+# --- Global Password Protection ---
+def check_password():
+    """
+    Returns True if the user enters the correct global password.
+    The expected password is stored in st.secrets["password"].
+    """
+    def password_entered():
+        # Compare user-entered password with the stored secret
+        if hmac.compare_digest(st.session_state["password"], st.secrets["password"]):
+            st.session_state["password_correct"] = True
+            # Remove password from session state for security
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.text_input("Password", type="password", on_change=password_entered, key="password")
+    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+        st.error("😕 Password incorrect")
+    return st.session_state.get("password_correct", False)
+
+if not check_password():
+    st.stop()
+# --- End Global Password Protection ---
+
+
 import os
 import json
 import time
@@ -5,42 +36,8 @@ from typing import List, Dict, Optional
 import cohere
 from cohere.client import Client as CohereClient
 from cohere.compass.clients.compass import CompassClient
-import streamlit as st
 
-
-import streamlit as st
-import streamlit_authenticator as stauth
-
-# Define your users
-names = ['rev1']
-usernames = ['rev1']
-
-# Define the password in plain text that will be hashed.
-# In a production app, you would store these hashes securely (or use Streamlit Secrets).
-passwords = ['your_password_here']  # Change this to your chosen password
-
-# Generate hashed passwords. (Make sure to use 'generate_hashes()' method.)
-hashed_passwords = stauth.Hasher(passwords).generate_hashes()
-
-# Initialize the authenticator.
-authenticator = stauth.Authenticate(
-    {'names': names, 'usernames': usernames, 'passwords': hashed_passwords},
-    'some_cookie_name',  # Change this to a cookie name of your choice
-    'some_signature_key',  # Change this to a secret signature key
-    cookie_expiry_days=30
-)
-
-# Create the login widget.
-name, authentication_status, username = authenticator.login('Login', 'main')
-
-# Check if the user is authenticated.
-if not authentication_status:
-    st.error("Username/password is incorrect")
-    st.stop()  # Prevents the app from continuing until the user logs in
-else:
-    st.success(f"Welcome, {name}!")
-
-
+# -------------------- TranscriptRAGAgent Class --------------------
 class TranscriptRAGAgent:
     def __init__(self, compass_url: str, compass_token: str, cohere_api_key: str):
         # Initialize API clients
@@ -52,11 +49,10 @@ class TranscriptRAGAgent:
             index_url=compass_url,
             bearer_token=compass_token
         )
-        
         # Tracking research state
         self.research_steps = []
         self.collected_evidence = []
-        
+
     def get_relevant_chunks(self, query: str, limit: int = 10) -> List[Dict]:
         """Search the 'transcripts' index using Compass."""
         try:
@@ -65,7 +61,6 @@ class TranscriptRAGAgent:
                 query=query,
                 top_k=limit
             )
-            
             documents = []
             if search_results.hits:
                 for idx, hit in enumerate(search_results.hits):
@@ -93,7 +88,6 @@ Examples:
             model="command-r-plus-08-2024",
             temperature=0.2
         )
-        
         steps = [
             line.strip() 
             for line in response.text.split("\n") 
@@ -107,7 +101,6 @@ Examples:
     def analyze_evidence(self, evidence: List[Dict], query: str) -> Dict:
         """Check whether we have enough info to thoroughly answer the user's question."""
         evidence_text = "\n\n".join(e["snippet"] for e in evidence)
-        
         prompt = f"""We have the following transcript excerpts related to the question:
 "{query}"
 
@@ -127,7 +120,6 @@ Respond in JSON in the following format:
             model="command-r-plus-08-2024",
             temperature=0.1
         )
-        
         try:
             return json.loads(response.text)
         except Exception as e:
@@ -140,8 +132,6 @@ Respond in JSON in the following format:
     def synthesize_answer(self, evidence: List[Dict], query: str) -> str:
         """Generate final comprehensive answer from transcript excerpts."""
         evidence_text = "\n\n".join(e["snippet"] for e in evidence)
-
-        # We include prompt engineering here to encourage answers that reference the focus group discussion.
         prompt = f"""
 You are a top-tier analyst specializing in transcript data. The user asked:
 "{query}"
@@ -158,7 +148,6 @@ Include references to sources when relevant (e.g., [doc_0]).
             model="command-r-plus-08-2024",
             temperature=0.0
         )
-        
         return response.text
 
     def research(self, query: str, max_steps: int = 5) -> Dict:
@@ -167,38 +156,27 @@ Include references to sources when relevant (e.g., [doc_0]).
         """
         self.research_steps = []
         self.collected_evidence = []
-        
         planned_queries = self.plan_research(query)
-        
         step_count = 0
         for search_query in planned_queries:
             if step_count >= max_steps:
                 break
-                
             self.research_steps.append({
                 "step": step_count + 1,
                 "action": "search",
                 "query": search_query
             })
-            
-            # Search for relevant transcript chunks
             new_evidence = self.get_relevant_chunks(search_query)
             self.collected_evidence.extend(new_evidence)
-            
-            # Analyze if we have enough evidence
             analysis = self.analyze_evidence(self.collected_evidence, query)
             step_count += 1
-            
             if analysis["is_complete"]:
                 break
             if step_count >= max_steps:
                 break
-                
             if analysis["next_query"]:
                 planned_queries.append(analysis["next_query"])
-        
         final_answer = self.synthesize_answer(self.collected_evidence, query)
-        
         return {
             "query": query,
             "steps": self.research_steps,
@@ -213,7 +191,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS
 st.markdown("""
 <style>
 .research-step {
@@ -238,26 +215,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize agent in session state if not present
 if 'agent' not in st.session_state:
-    required_vars = [
-        "COHERE_API_KEY",
-        "COMPASS_TOKEN",
-        "COMPASS_URL"
-    ]
-    
+    required_vars = ["COHERE_API_KEY", "COMPASS_TOKEN", "COMPASS_URL"]
     missing_vars = [var for var in required_vars if not os.environ.get(var)]
     if missing_vars:
         st.error(f"Missing environment variables: {', '.join(missing_vars)}")
         st.stop()
-    
     st.session_state.agent = TranscriptRAGAgent(
         compass_url=os.environ["COMPASS_URL"],
         compass_token=os.environ["COMPASS_TOKEN"],
         cohere_api_key=os.environ["COHERE_API_KEY"]
     )
 
-# Sidebar UI
 with st.sidebar:
     st.title("Cohere powered RAG")
     st.write("""
@@ -265,10 +234,8 @@ with st.sidebar:
     and I'll retrieve and summarize relevant insights.
     """)
     max_steps = 5
-    # Toggle to enable concise answer generation
     concise_toggle = st.checkbox("Generate a concise answer", value=False)
 
-# Main interface
 st.title("Multi file insights with Rev")
 query = st.text_area("Enter your transcript-based question:", height=100)
 
@@ -279,8 +246,6 @@ if st.button("Submit"):
         with st.spinner("Gathering insights..."):
             result = st.session_state.agent.research(query, max_steps=max_steps)
             final_answer = result["answer"]
-            
-            # If concise toggle is enabled, transform the answer via additional prompt engineering
             if concise_toggle:
                 concise_prompt = f"""
 Rewrite the following detailed answer into a concise, well-rounded summary.
@@ -298,12 +263,8 @@ Detailed answer:
                     temperature=0.0
                 )
                 final_answer = response.text.strip()
-            
-            # Display only the final answer text
             st.subheader("Answer")
             st.markdown(final_answer)
-            
-            # Optionally show sources if needed
             with st.expander("View Sources"):
                 for idx, evidence in enumerate(result["evidence"]):
                     st.markdown(f"**Source {idx + 1}:**")
