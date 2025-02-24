@@ -1,322 +1,275 @@
-import streamlit as st
-import hmac
 import os
 import json
+import time
 from typing import List, Dict, Optional
 import cohere
 from cohere.client import Client as CohereClient
 from cohere.compass.clients.compass import CompassClient
+import streamlit as st
 
-# -----------------------------------------
-# Global Password Protection (if desired)
-# -----------------------------------------
-def check_password():
-    """
-    Returns True if the user enters the correct global password.
-    The expected password is stored in st.secrets["password"].
-    """
-    def password_entered():
-        if hmac.compare_digest(st.session_state["password"], st.secrets["password"]):
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if st.session_state.get("password_correct", False):
-        return True
-
-    st.text_input("Password", type="password", on_change=password_entered, key="password")
-    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
-        st.error("Incorrect password.")
-    return st.session_state.get("password_correct", False)
-
-if not check_password():
-    st.stop()
-
-# -----------------------------------------
-# Hidden config
-# -----------------------------------------
-SINGLE_RETRIEVAL_TOP_K = 10
-MULTI_RETRIEVAL_TOP_K = 8
-MAX_ROUNDS = 3
-CONFIDENCE_THRESHOLD = 0.0
-
-# -----------------------------------------
-# TranscriptRAGAgent Class
-# -----------------------------------------
 class TranscriptRAGAgent:
-    """
-    Incorporates:
-    - Heuristic to decide single-hop vs multi-hop
-    - If multi-hop, do the plan_research approach
-    - Mandatory references in final answer
-    - Output styles (concise, default, verbose)
-    """
-
     def __init__(self, compass_url: str, compass_token: str, cohere_api_key: str):
-        try:
-            self.co = CohereClient(api_key=cohere_api_key, client_name="transcript-rag-agent")
-        except Exception as e:
-            st.error(f"Error initializing Cohere client: {e}")
-            st.stop()
-        try:
-            self.compass_client = CompassClient(index_url=compass_url, bearer_token=compass_token)
-        except Exception as e:
-            st.error(f"Error initializing Compass client: {e}")
-            st.stop()
-
-        self.confidence_threshold = CONFIDENCE_THRESHOLD
-
-    # --- Heuristic: LLM call to decide multi-hop or single-hop
-    def decide_if_multihop(self, user_query: str) -> bool:
-        """
-        A quick LLM-based classification:
-        Return True if multi-hop needed, False if single-hop likely suffices.
-        """
-        system_prompt = (
-            "You are a classification model. The user question might need multiple sub-queries (multi-hop) or not.\n"
-            "Please return valid JSON with a single boolean field 'is_multihop'."
+        # Initialize API clients
+        self.co = CohereClient(
+            api_key=cohere_api_key,
+            client_name="transcript-rag-agent"
         )
-        decision_prompt = (
-            f"{system_prompt}\n\nUser question: '{user_query}'\n"
-            "Decide if multi-hop is needed. For example, if the question is complex, has multiple parts, or requires combining info across different transcripts.\n\n"
-            "Output JSON:\n{\n  \"is_multihop\": true or false\n}"
+        self.compass_client = CompassClient(
+            index_url=compass_url,
+            bearer_token=compass_token
         )
+        
+        # Tracking research state
+        self.research_steps = []
+        self.collected_evidence = []
+        
+    def get_relevant_chunks(self, query: str, limit: int = 10) -> List[Dict]:
+        """Search the 'transcripts' index using Compass."""
         try:
-            resp = self.co.chat(message=decision_prompt, model="command-r-plus-08-2024", temperature=0.2)
-            raw_text = resp.text.strip()
-            # Attempt parse
-            parsed = json.loads(raw_text)
-            if "is_multihop" in parsed and isinstance(parsed["is_multihop"], bool):
-                return parsed["is_multihop"]
-            # fallback
-            return False
+            search_results = self.compass_client.search_chunks(
+                index_name="transcripts",  # updated index
+                query=query,
+                top_k=limit
+            )
+            
+            documents = []
+            if search_results.hits:
+                for idx, hit in enumerate(search_results.hits):
+                    text = hit.content.get("text", "")
+                    documents.append({
+                        "title": f"doc_{idx}",
+                        "snippet": text
+                    })
+            return documents
         except Exception as e:
-            st.warning(f"Heuristic LLM error, defaulting single-hop: {e}")
-            return False
-
-    # --- Single-hop retrieval
-    def retrieve_once(self, query: str, top_k: int = 10) -> List[Dict]:
-        """
-        Simple direct retrieval from Compass, return chunk list.
-        """
-        try:
-            results = self.compass_client.search_chunks(index_name="compass-rev", query=query, top_k=top_k)
-            docs = []
-            if results.hits:
-                for idx, h in enumerate(results.hits):
-                    text = h.content.get("text", "")
-                    score = getattr(h, "score", 1.0)
-                    if score >= self.confidence_threshold:
-                        docs.append({
-                            "title": f"doc_{idx}",
-                            "snippet": text,
-                            "score": score
-                        })
-            return docs
-        except Exception as e:
-            st.error(f"Compass error: {e}")
+            st.error(f"Error retrieving documents: {e}")
             return []
 
-    # --- Multi-hop approach
-    def plan_research(self, user_query: str) -> List[str]:
-        """
-        LLM suggests sub-queries if the question is complex.
-        """
-        sys_msg = (
-            "You are a helpful assistant that breaks down the question into 2-5 sub-queries if needed, otherwise return it unchanged."
+    def plan_research(self, query: str) -> List[str]:
+        """Plan a multi-step approach to gather thorough insights from transcripts."""
+        prompt = f"""You are an expert analyzing transcripts. The user wants to explore this question:
+"{query}"
+
+Generate 3-5 short 'search queries' or 'research steps' that will gather all needed information.
+Example:
+1. "Azure revenue over time"
+2. "Factors impacting cloud growth"
+"""
+        response = self.co.chat(
+            message=prompt,
+            model="command-r-plus-08-2024",
+            temperature=0.2
         )
-        prompt = (
-            f"{sys_msg}\n\nUser Query: {user_query}\n\n"
-            "Provide 2-5 bullet points, each sub-query or short search query."
+        
+        steps = [
+            line.strip() 
+            for line in response.text.split("\n") 
+            if line.strip() and line[0].isdigit()
+        ]
+        # Fallback if no steps extracted
+        if not steps:
+            steps = [query]
+        return steps
+
+    def analyze_evidence(self, evidence: List[Dict], query: str) -> Dict:
+        """Check whether we have enough info to thoroughly answer the user's question."""
+        evidence_text = "\n\n".join(e["snippet"] for e in evidence)
+        
+        prompt = f"""We have the following transcript snippets related to: "{query}"
+
+{evidence_text}
+
+Do we have enough information to answer the question in detail? 
+If not, what else do we need?
+
+Respond in JSON:
+{{
+    "is_complete": true/false,
+    "gaps": ["gap1", "gap2"],
+    "next_query": "some next search query"
+}}
+"""
+        response = self.co.chat(
+            message=prompt,
+            model="command-r-plus-08-2024",
+            temperature=0.1
         )
+        
         try:
-            resp = self.co.chat(message=prompt, model="command-r-plus-08-2024", temperature=0.2)
-            lines = resp.text.strip().split("\n")
-            steps = []
-            for line in lines:
-                line_stripped = line.strip()
-                if line_stripped and (line_stripped[0].isdigit() or line_stripped.startswith("-")):
-                    cleaned = line_stripped.lstrip("0123456789.-) ")
-                    steps.append(cleaned)
-            if not steps:
-                return [user_query]
-            return steps[:5]
+            return json.loads(response.text)
         except:
-            return [user_query]
+            return {
+                "is_complete": True,
+                "gaps": [],
+                "next_query": None
+            }
 
-    def analyze_evidence(self, query: str, evidence: List[Dict]) -> Dict:
-        """
-        Check if we have enough info. Return a JSON with is_complete, next_query, etc.
-        """
-        snippet_text = ""
-        for i, e in enumerate(evidence):
-            snippet_text += f"[doc_{i}, score={e['score']:.2f}]: {e['snippet'][:300]}\n\n"
+    def synthesize_answer(self, evidence: List[Dict], query: str) -> str:
+        """Generate final comprehensive answer from transcript snippets."""
+        evidence_text = "\n\n".join(e["snippet"] for e in evidence)
 
-        sys_msg = (
-            "You are a thorough analyst. Only rely on the provided text. If more info is needed, propose a new sub-query."
+        prompt = f"""
+You are a top-tier analyst focusing on transcripts. The user asked: "{query}"
+Here are relevant transcript excerpts:
+{evidence_text}
+
+Craft a thorough, cohesive summary or answer addressing the user's question. 
+Use examples, references (like [doc_0]) if needed. Maintain a clear and concise style.
+"""
+        response = self.co.chat(
+            message=prompt,
+            model="command-r-plus-08-2024",
+            temperature=0.0
         )
-        prompt = (
-            f"{sys_msg}\n\nUser query: {query}\n\nSnippets:\n{snippet_text}\n\n"
-            "Are these sufficient? If not, propose next_query.\n"
-            "Respond in JSON:\n"
-            "{ \"is_complete\": true/false, \"next_query\": \"some text or null\" }"
-        )
-        try:
-            resp = self.co.chat(message=prompt, model="command-r-plus-08-2024", temperature=0.2)
-            raw = resp.text.strip()
-            parsed = json.loads(raw)
-            if "is_complete" not in parsed:
-                parsed["is_complete"] = True
-            if "next_query" not in parsed:
-                parsed["next_query"] = None
-            return parsed
-        except:
-            return {"is_complete": True, "next_query": None}
+        
+        return response.text
 
-    # -- Multi-step orchestrator
-    def multi_hop_research(self, user_query: str, max_rounds: int = 3, top_k: int = 8) -> List[Dict]:
+    def research(self, query: str, max_steps: int = 5) -> Dict:
         """
-        Plan sub-queries => retrieve => accumulate => check if complete => possibly new query => done
-        Return the final list of combined evidence
+        Execute the multi-step approach to find and synthesize an answer for a 
+        transcript-based question.
         """
-        final_evidence = []
-        sub_queries = self.plan_research(user_query)
-        round_count = 0
-        for sq in sub_queries:
-            if round_count >= max_rounds:
+        self.research_steps = []
+        self.collected_evidence = []
+        
+        planned_queries = self.plan_research(query)
+        
+        step_count = 0
+        for search_query in planned_queries:
+            if step_count >= max_steps:
                 break
-            new_evs = self.retrieve_once(sq, top_k)
-            final_evidence.extend(new_evs)
-            analysis = self.analyze_evidence(user_query, final_evidence)
+                
+            self.research_steps.append({
+                "step": step_count + 1,
+                "action": "search",
+                "query": search_query
+            })
+            
+            # Search
+            new_evidence = self.get_relevant_chunks(search_query)
+            self.collected_evidence.extend(new_evidence)
+            
+            # Analyze
+            analysis = self.analyze_evidence(self.collected_evidence, query)
+            step_count += 1
+            
             if analysis["is_complete"]:
                 break
+            if step_count >= max_steps:
+                break
+                
             if analysis["next_query"]:
-                sub_queries.append(analysis["next_query"])
-            round_count += 1
-        return final_evidence
-
-    # -- Single method to gather context
-    def gather_evidence(self, user_query: str) -> List[Dict]:
-        # 1) Decide if multi-hop
-        is_multi = self.decide_if_multihop(user_query)
-        if is_multi:
-            st.write("DEBUG: Multi-hop approach triggered.")
-            return self.multi_hop_research(user_query, MAX_ROUNDS, MULTI_RETRIEVAL_TOP_K)
-        else:
-            st.write("DEBUG: Single-hop approach triggered.")
-            return self.retrieve_once(user_query, SINGLE_RETRIEVAL_TOP_K)
-
-    # -- Synthesis with mandatory snippet references + style
-    def synthesize_answer(self, query: str, evidence: List[Dict], style: str = "default") -> str:
-        if not evidence:
-            return "I do not have enough information from the transcripts."
-
-        # Merge snippet text
-        snippet_block = ""
-        for i, e in enumerate(evidence):
-            # keep it shorter if there's a lot
-            snippet_block += f"[doc_{i}, score={e['score']:.2f}]: {e['snippet']}\n\n"
-
-        # Style instructions
-        if style == "concise":
-            style_instructions = (
-                "Respond in a short, concise bullet-point style. "
-                "For each bullet, reference at least one [doc_i]. "
-                "Omit any bullet that lacks snippet support."
-            )
-        elif style == "verbose":
-            style_instructions = (
-                "Respond in a thorough, detailed format. "
-                "Use paragraphs and more context from the snippets. "
-                "Still, each major statement must cite [doc_i]. "
-                "If no snippet supports a statement, omit it."
-            )
-        else:
-            style_instructions = (
-                "Provide a clear, structured bullet-point answer. "
-                "Each bullet must cite [doc_i]."
-            )
-
-        sys_prompt = (
-            "You are a careful, fact-based assistant that ONLY uses the provided transcript snippets. "
-            "If the information is not there, say so. "
-            "Do NOT add any knowledge not found in the snippets."
-        )
-        final_prompt = f"""
-{sys_prompt}
-
-User asked: "{query}"
-
-Snippets:
-{snippet_block}
-
-Style Guidance: {style_instructions}
-
-Final Answer:
-"""
-        try:
-            resp = self.co.chat(message=final_prompt, model="command-r-plus-08-2024", temperature=0.0)
-            return resp.text.strip()
-        except Exception as e:
-            st.error(f"Error in synthesis LLM call: {e}")
-            return "I'm sorry, I encountered an error generating the final answer."
-
-    # -- Full pipeline
-    def answer_query(self, user_query: str, style: str) -> Dict:
-        evidence = self.gather_evidence(user_query)
-        final_answer = self.synthesize_answer(user_query, evidence, style)
+                planned_queries.append(analysis["next_query"])
+        
+        final_answer = self.synthesize_answer(self.collected_evidence, query)
+        
         return {
-            "query": user_query,
-            "evidence": evidence,
+            "query": query,
+            "steps": self.research_steps,
+            "evidence": self.collected_evidence,
             "answer": final_answer
         }
 
-# -----------------------------------------
-# Streamlit UI
-# -----------------------------------------
+# -------------------- Streamlit UI Code --------------------
 st.set_page_config(
-    page_title="Transcript RAG - Multi/Single-hop + Mandatory Citations",
+    page_title="Multi file insights with Rev",
+    page_icon="🔍",
     layout="wide"
 )
 
-st.title("Transcript Q&A - Multi vs Single-hop with 3 Styles")
+# Custom CSS
+st.markdown("""
+<style>
+.research-step {
+    padding: 1rem;
+    margin: 0.5rem 0;
+    border-radius: 4px;
+    background-color: #f8f9fa;
+}
+.evidence-box {
+    padding: 1rem;
+    margin: 0.5rem 0;
+    border-radius: 4px;
+    background-color: #e9ecef;
+}
+.answer-section {
+    padding: 2rem;
+    margin: 1rem 0;
+    border-radius: 8px;
+    background-color: white;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+</style>
+""", unsafe_allow_html=True)
 
-# Initialize agent
 if 'agent' not in st.session_state:
-    required_vars = ["COHERE_API_KEY", "COMPASS_TOKEN", "COMPASS_URL"]
-    missing_vars = [v for v in required_vars if not os.environ.get(v)]
+    required_vars = [
+        "COHERE_API_KEY",
+        "COMPASS_TOKEN",
+        "COMPASS_URL"
+    ]
+    
+    missing_vars = [var for var in required_vars if not os.environ.get(var)]
     if missing_vars:
         st.error(f"Missing environment variables: {', '.join(missing_vars)}")
         st.stop()
+    
     st.session_state.agent = TranscriptRAGAgent(
         compass_url=os.environ["COMPASS_URL"],
         compass_token=os.environ["COMPASS_TOKEN"],
         cohere_api_key=os.environ["COHERE_API_KEY"]
     )
 
-query = st.text_area("Enter your question about the transcripts:", height=100)
-style_mode = st.selectbox(
-    "Answer Style",
-    options=["default", "concise", "verbose"],
-    index=0,
-    help="Choose the level of detail for the final answer."
-)
+# Sidebar
+with st.sidebar:
+    st.title("Cohere powered RAG")
+    st.write("""
+    Provide a question about your transcripts,
+    and I'll retrieve and summarize relevant insights.
+    """)
+    max_steps = 5
+    # New toggle for generating a concise answer
+    concise_toggle = st.checkbox("Generate a concise answer", value=False)
 
-if st.button("Submit Question"):
+# Main interface
+st.title("Multi file insights with Rev")
+
+query = st.text_area("Enter your transcript-based question:", height=100)
+
+if st.button("Submit"):
     if not query.strip():
         st.warning("Please enter a question.")
     else:
-        with st.spinner("Gathering information..."):
-            result_dict = st.session_state.agent.answer_query(query, style_mode)
-            final_answer = result_dict["answer"]
+        with st.spinner("Gathering insights..."):
+            result = st.session_state.agent.research(query, max_steps=max_steps)
+            
+            final_answer = result["answer"]
+            # If concise toggle is enabled, run additional transformation
+            if concise_toggle:
+                concise_prompt = f"""
+You are a top-tier analyst. The following is a detailed answer based on transcript excerpts:
+"{final_answer}"
 
-        st.subheader("Answer")
-        st.write(final_answer)
+Now, please rewrite the answer in a concise Q&A format similar to:
+Q: [Your question here]
+A: [Concise answer]
 
-        with st.expander("Show Evidence & Debug"):
-            st.markdown("**Retrieved Evidence**")
-            for idx, e in enumerate(result_dict["evidence"]):
-                st.write(f"doc_{idx} (score={e['score']:.2f})")
-                st.write(e["snippet"][:300] + "...")
-                st.markdown("---")
+Ensure the answer is brief, to the point, and mentions the source if applicable.
+"""
+                response = st.session_state.agent.co.chat(
+                    message=concise_prompt,
+                    model="command-r-plus-08-2024",
+                    temperature=0.0
+                )
+                final_answer = response.text
+            
+            # Display final answer
+            st.subheader("Answer")
+            st.markdown(final_answer)
+            
+            # Optionally show sources
+            with st.expander("View Sources"):
+                for idx, evidence in enumerate(result["evidence"]):
+                    st.markdown(f"**Source {idx + 1}:**")
+                    st.markdown(evidence["snippet"])
+                    st.markdown("---")
