@@ -56,7 +56,7 @@ class TranscriptRAGAgent:
         """Search the 'transcripts' index using Compass."""
         try:
             search_results = self.compass_client.search_chunks(
-                index_name="transcripts",  # updated index
+                index_name="compass-rev",  # updated index
                 query=query,
                 top_k=limit
             )
