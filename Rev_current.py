@@ -3,6 +3,7 @@ import streamlit as st
 import os
 import json
 import time
+import re
 from typing import List, Dict, Optional
 import cohere
 from cohere.client import Client as CohereClient
@@ -52,11 +53,14 @@ class TranscriptRAGAgent:
         self.research_steps = []
         self.collected_evidence = []
         
-    def get_relevant_chunks(self, query: str, limit: int = 10) -> List[Dict]:
-        """Search the 'transcripts' index using Compass."""
+    def get_relevant_chunks(self, query: str, limit: int = 25) -> List[Dict]:
+        """
+        Search the 'transcripts' index using Compass.
+        Returns more chunks for better coverage of broad queries.
+        """
         try:
             search_results = self.compass_client.search_chunks(
-                index_name="compass-rev",  # updated indexa
+                index_name="compass-rev",
                 query=query,
                 top_k=limit
             )
@@ -64,8 +68,16 @@ class TranscriptRAGAgent:
             if search_results.hits:
                 for idx, hit in enumerate(search_results.hits):
                     text = hit.content.get("text", "")
+                    
+                    # Try to extract source information safely
+                    source_filename = f"document_{idx}"
+                    # Check if there's document information in the content
+                    if hasattr(hit, 'document_id'):
+                        source_filename = hit.document_id
+                    
                     documents.append({
                         "title": f"doc_{idx}",
+                        "source": source_filename,
                         "snippet": text
                     })
             return documents
@@ -74,14 +86,25 @@ class TranscriptRAGAgent:
             return []
 
     def plan_research(self, query: str) -> List[str]:
-        """Plan a multi-step approach to gather thorough insights from transcripts."""
+        """
+        Plan a multi-step approach to gather thorough insights from transcripts.
+        Enhanced to generate more specific and targeted search queries.
+        """
         prompt = f"""You are an expert analyzing transcripts. The user wants to explore this question:
 "{query}"
 
-Generate 3-5 short 'search queries' or 'research steps' that will gather all needed information.
-Example:
-1. "Azure revenue over time"
-2. "Factors impacting cloud growth"
+Your task is to break down this question into 4-6 specific search queries that together will provide comprehensive coverage.
+
+For broad questions that involve multiple entities, time periods, or concepts, create separate queries for each component.
+For questions about specific projects or concepts that might be ambiguous, create queries that help distinguish them from similar terms.
+
+Generate specific queries that:
+1. Cover different aspects of the main question
+2. Help disambiguate between potentially confusing concepts
+3. Target specific time periods, people, or projects mentioned
+4. Gather comprehensive information across multiple documents
+
+Return ONLY numbered search queries, one per line:
 """
         response = self.co.chat(
             message=prompt,
@@ -90,31 +113,45 @@ Example:
         )
         
         steps = [
-            line.strip() 
+            line.strip().strip('"\'') 
             for line in response.text.split("\n") 
-            if line.strip() and line[0].isdigit()
+            if line.strip() and (line[0].isdigit() or re.match(r'^"', line.strip()))
         ]
+        # Clean up the steps to remove numbers and quotes
+        steps = [re.sub(r'^\d+\.\s*', '', step).strip('"\'') for step in steps if step]
+        
         # Fallback if no steps extracted
         if not steps:
             steps = [query]
         return steps
 
     def analyze_evidence(self, evidence: List[Dict], query: str) -> Dict:
-        """Check whether we have enough info to thoroughly answer the user's question."""
-        evidence_text = "\n\n".join(e["snippet"] for e in evidence)
+        """
+        Check whether we have enough info to thoroughly answer the user's question.
+        Enhanced to better identify gaps in information.
+        """
+        evidence_text = "\n\n".join([
+            f"[Source: {e.get('source', 'document')}]\n{e['snippet']}" 
+            for e in evidence
+        ])
         
         prompt = f"""We have the following transcript snippets related to: "{query}"
 
 {evidence_text}
 
-Do we have enough information to answer the question in detail? 
-If not, what else do we need?
+Your task is to carefully analyze whether we have sufficient, relevant, and comprehensive information to answer the original question.
+
+Consider:
+1. Do we have relevant information from multiple perspectives?
+2. Is there information about all entities, projects, or concepts mentioned in the question?
+3. For time-based questions, do we have data covering the entire requested time period?
+4. For questions about specific concepts, do we have clear definitions that disambiguate them from similar concepts?
 
 Respond in JSON:
 {{
     "is_complete": true/false,
-    "gaps": ["gap1", "gap2"],
-    "next_query": "some next search query"
+    "gaps": ["specific gap 1", "specific gap 2"],
+    "next_query": "specific search query to fill the most important gap"
 }}
 """
         response = self.co.chat(
@@ -133,27 +170,49 @@ Respond in JSON:
             }
 
     def synthesize_answer(self, evidence: List[Dict], query: str) -> str:
-        """Generate final comprehensive answer from transcript snippets."""
-        evidence_text = "\n\n".join(e["snippet"] for e in evidence)
-        prompt = f"""
-You are a top-tier analyst focusing on transcripts. The user asked: "{query}"
+        """
+        Generate final comprehensive answer from transcript snippets.
+        Uses a simpler approach that gives the model more freedom to organize the response.
+        """
+        evidence_text = "\n\n".join([
+            f"[Source: {e.get('source', 'document')}]\n{e['snippet']}" 
+            for e in evidence
+        ])
+        
+        prompt = f"""You are a top-tier analyst focusing on transcripts. The user asked: "{query}"
+
 Here are relevant transcript excerpts:
 {evidence_text}
 
 Craft a thorough, cohesive summary or answer addressing the user's question. 
-Use examples, references (like [doc_0]) if needed. Maintain a clear and concise style.
+Organize information logically and use appropriate formatting to make your answer clear and readable.
+Do not include source citations in your answer.
+
+When discussing projects or activities:
+- Group related items together into meaningful categories
+- Consider using bullet points for lists when appropriate
+- Use bold formatting to highlight key projects or themes
+- Acknowledge any limitations or inconsistencies in the information
+
+Maintain a clear and concise style throughout your response.
 """
         response = self.co.chat(
             message=prompt,
             model="command-r-plus-08-2024",
             temperature=0.0
         )
-        return response.text
+        
+        # Add a "Sources" section at the end with all unique sources
+        unique_sources = list(set(e.get('source', 'document') for e in evidence))
+        sources_text = "\n\n## Sources\n" + "\n".join([f"{source}" for source in unique_sources])
+        
+        return response.text + sources_text
 
     def research(self, query: str, max_steps: int = 5) -> Dict:
         """
         Execute the multi-step approach to find and synthesize an answer for a 
         transcript-based question.
+        Enhanced to gather more comprehensive results.
         """
         self.research_steps = []
         self.collected_evidence = []
@@ -171,9 +230,14 @@ Use examples, references (like [doc_0]) if needed. Maintain a clear and concise 
                 "query": search_query
             })
             
-            # Search
-            new_evidence = self.get_relevant_chunks(search_query)
-            self.collected_evidence.extend(new_evidence)
+            # Search with increased limit for more comprehensive results
+            new_evidence = self.get_relevant_chunks(search_query, limit=25)
+            
+            # Only add unique evidence (avoid duplicates)
+            existing_snippets = {e["snippet"] for e in self.collected_evidence}
+            unique_new_evidence = [e for e in new_evidence if e["snippet"] not in existing_snippets]
+            
+            self.collected_evidence.extend(unique_new_evidence)
             
             # Analyze
             analysis = self.analyze_evidence(self.collected_evidence, query)
@@ -265,4 +329,3 @@ if st.button("Submit"):
             # Display final answer only
             st.subheader("Answer")
             st.markdown(result["answer"])
-            
