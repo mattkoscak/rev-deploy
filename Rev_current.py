@@ -60,7 +60,7 @@ class TranscriptRAGAgent:
         """
         try:
             search_results = self.compass_client.search_chunks(
-                index_name="compass-rev",
+                index_name="rev-custom-contextual-chunks",
                 query=query,
                 top_k=limit
             )
@@ -309,10 +309,7 @@ if 'agent' not in st.session_state:
 
 # Sidebar
 with st.sidebar:
-    st.title("Beta Test - Compass powered multi-file insights")
-    st.write("""
-    Transcript Q&A at scale
-    """)
+    st.title("Version B")
     max_steps = 5
 
 # Main interface
